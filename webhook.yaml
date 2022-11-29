@@ -1,0 +1,157 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: webhook-certificate
+  namespace: default
+spec:
+  secretName: webhook-certificate
+  dnsNames:
+  - webhook.default.svc
+  issuerRef:
+    name: selfsigned
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: selfsigned
+  namespace: default
+spec:
+  selfSigned: {}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: webhook-code
+data:
+  server.js: |
+    const https = require('node:https');
+    const fs = require('node:fs');
+
+    const options = {
+      key: fs.readFileSync('/certs/tls.key'),
+      cert: fs.readFileSync('/certs/tls.crt'),
+    };
+
+    https
+      .createServer(options, async function (req, res) {
+        try {
+          let buf = '';
+          for await (const chunk of req) buf += chunk.toString();
+          const body = JSON.parse(buf);
+
+          const patches = [];
+          const containers = body.request.object.spec.containers;
+
+          for (let i = 0; i < containers.length; i++)
+            if (containers[i].resources)
+              patches.push({
+                op: 'replace',
+                path: `/spec/containers/${i}/resources`,
+                value: {},
+              });
+
+          const review = {
+            apiVersion: 'admission.k8s.io/v1',
+            kind: 'AdmissionReview',
+            response: {
+              uid: body.request.uid,
+              allowed: true,
+            },
+          };
+
+          if (patches.length > 0) {
+            review.response.patchType = 'JSONPatch';
+            review.response.patch = Buffer.from(JSON.stringify(patches)).toString(
+              'base64'
+            );
+          }
+
+          const metadata = body.request.object.metadata || {};
+          console.log(
+            `applying patches to pod ${metadata.name || metadata.generateName} in namespace ${metadata.namespace}`
+          );
+          console.table(patches);
+
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.write(JSON.stringify(review));
+          res.end();
+        } catch (err) {
+          console.log(err);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.write(JSON.stringify({ msg: 'error' }));
+          res.end();
+        }
+      })
+      .listen(8000);
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webhook
+spec:
+  selector:
+    matchLabels:
+      app: my-webhook
+  template:
+    metadata:
+      labels:
+        app: my-webhook
+    spec:
+      volumes:
+        - name: certs
+          secret:
+            secretName: webhook-certificate
+        - name: code
+          configMap:
+            name: webhook-code
+      containers:
+      - name: webhook
+        image: node:18
+        command:
+          - node
+          - /app/server.js
+        resources: {}
+        volumeMounts:
+          - mountPath: /certs
+            name: certs
+          - mountPath: /app
+            name: code
+        ports:
+        - containerPort: 8000
+          name: https
+          protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: webhook
+spec:
+  selector:
+    app: my-webhook
+  ports:
+  - port: 443
+    targetPort: https
+    protocol: TCP
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: webhook
+  annotations:
+    cert-manager.io/inject-ca-from: default/webhook-certificate
+webhooks:
+  - name: webhook.default.svc
+    rules:
+      - operations: ["CREATE"]
+        apiGroups: [""]
+        apiVersions: ["v1"]
+        resources: ["pods"]
+    clientConfig:
+      service:
+        name: webhook
+        namespace: default
+    admissionReviewVersions:
+      - v1
+      - v1beta1
+    sideEffects: None
+    failurePolicy: Ignore
